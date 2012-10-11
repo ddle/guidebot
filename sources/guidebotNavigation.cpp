@@ -39,6 +39,7 @@
 #include <mrpt/slam/COccupancyGridMap2D.h>
 #include <mrpt/hwdrivers/CActivMediaRobotBase.h>
 #include <iostream>
+#include <mrpt/synch/CCriticalSection.h>
 
 using namespace mrpt;
 using namespace mrpt::hwdrivers;
@@ -78,10 +79,10 @@ static string MAP_FILE			=	"FAB-LL-Central-200px.png";
 static float MAP_RESOLUTION		= 	0.048768f;
 static int X_CENTRAL_PIXEL		=	-1; /* start location, ()-1,-1) means center of map */ 
 static int Y_CENTRAL_PIXEL		=	-1;
-
-static CMonteCarloLocalization2D pdf;
+static double OBSTACLE_DISTANCE =	0.8;
+//static CMonteCarloLocalization2D pdf;
 static float kinectMinTruncateDistance = 0.5;
-
+static int stepsBeforeOverwrite  = 2;
 /* our threads 's sharing resources */
 struct TThreadRobotParam
 {
@@ -103,10 +104,13 @@ struct TThreadRobotParam
 	//mrpt::synch::CThreadSafeVariable<CActionCollectionPtr>       actions;
 	//mrpt::synch::CThreadSafeVariable<CSensoryFramePtr>           observations;
 	//mrpt::synch::CThreadSafeVariable<CMonteCarloLocalization2D>  pdf;
-	mrpt::synch::CThreadSafeVariable<CObjectPtr>                    pdf;
+	mrpt::synch::CThreadSafeVariable<CObjectPtr>   	 				pdf;
 	mrpt::synch::CThreadSafeVariable<CParticleFilter>               PF;
 	mrpt::synch::CThreadSafeVariable<bool>							displayNewPdf;
-
+	
+	mrpt::synch::CThreadSafeVariable<bool>							pdfIsReferencing;
+	mrpt::synch::CCriticalSection									pdf_lock;
+	mrpt::synch::CCriticalSection									robot_lock;
 	mrpt::synch::CThreadSafeVariable<std::deque<poses::TPoint2D> > 	thePath;
 	mrpt::synch::CThreadSafeVariable<bool>							displayNewPath;
 
@@ -148,7 +152,8 @@ void computePdfLikelihoodValues(COccupancyGridMap2D & map, CMonteCarloLocalizati
 void adjustCObservationRangeSonarPose( CObservationRange &obs );
 void thread_wall_detect(TThreadRobotParam &p);
 void fixOdometry(CPose2D & pose, CPose2D offset);
-
+void overwriteWithPdf(CActivMediaRobotBase & robot,TThreadRobotParam &p );
+bool isValidScan(CObservation2DRangeScan* scanData);
 /**************************************************************************************************/
 /*                                         FUNCTION IMPLEMENTATIONS                               */		
 /**************************************************************************************************/
@@ -199,7 +204,7 @@ void thread_update_pdf(TThreadRobotParam &p)
 	/****** MonteCarloLocalization  ******/
 	
 	uint64_t M = guidebotConfFile.read_uint64_t("LocalizationParams","PARTICLE_COUNT",1000, false);
-	pdf = CMonteCarloLocalization2D(M);
+	CMonteCarloLocalization2D pdf = CMonteCarloLocalization2D(M);
 
 	/* PDF Options: */
 	TMonteCarloLocalizationParams	pdfPredictionOptions;
@@ -218,8 +223,8 @@ void thread_update_pdf(TThreadRobotParam &p)
 	/* motion model */
 	CActionRobotMovement2D::TMotionModelOptions dummy_odom_params;
 	dummy_odom_params.modelSelection = CActionRobotMovement2D::mmGaussian;
-	dummy_odom_params.gausianModel.minStdXY  = guidebotConfFile.read_double("DummyOdometryParams","minStdXY",0.04);
-	dummy_odom_params.gausianModel.minStdPHI = DEG2RAD(guidebotConfFile.read_double("DummyOdometryParams","minStdPHI", 2.0));
+	dummy_odom_params.gausianModel.minStdXY  = guidebotConfFile.read_double("DummyOdometryParams","minStdXY",0.01);
+	dummy_odom_params.gausianModel.minStdPHI = DEG2RAD(guidebotConfFile.read_double("DummyOdometryParams","minStdPHI", 1.0));
 
 	CPose2D	pdfEstimation, odometryEstimation;	
 	//CPose2D currentOdo, previousOdo;
@@ -271,8 +276,9 @@ void thread_update_pdf(TThreadRobotParam &p)
 		/* pair of action-observation */
 		CActionCollectionPtr actions;
 		CSensoryFramePtr senFrame;		
-				
+		
 		CObservationPtr obsPtr;		
+
 		
 		/* get a copy of the most current pose */
 		currentOdo.x(p.currentOdo.get().x());
@@ -282,16 +288,26 @@ void thread_update_pdf(TThreadRobotParam &p)
 		/* it IS possible that computeFromOdometry return nothing if distance
 		 * between pose is tiny, adjust minStdXY if need */
 		
-		if (currentOdo.distanceTo(previousOdo) > 2*dummy_odom_params.gausianModel.minStdXY)
+		if (	
+				( currentOdo.distanceTo(previousOdo) > 2*dummy_odom_params.gausianModel.minStdXY )
+			||  ( abs( currentOdo.phi() - previousOdo.phi() ) > 2*dummy_odom_params.gausianModel.minStdPHI )
+		   )
 		{ 
-			/* make sure that we have new kinect reading */
-			CObservation2DRangeScan* obs_2d = getKinect2DScan(p, last_obs);			
-								
-			/* make sure that we have new kinect reading */
-			if (obs_2d == NULL)
-				continue;
-			obs_2d->truncateByDistanceAndAngle(kinectMinTruncateDistance,3);
+		
+			/* observation: */
 			senFrame = CSensoryFrame::Create(); /* get a sensoryFrame Ptr */
+			/* getting new kinect reading */
+			CObservation2DRangeScan* obs_2d = getKinect2DScan(p, last_obs);										
+			/* make sure that we have new kinect reading */
+			if (isValidScan(obs_2d) == true)
+			{
+				obs_2d->truncateByDistanceAndAngle(kinectMinTruncateDistance,3);
+				obsPtr.setFromPointerDoNotFreeAtDtor(obs_2d);
+				/* insert observation */
+				senFrame->insert(obsPtr);	
+			}
+						
+			/* action */
 			actions = CActionCollection::Create(); /* get an AC Ptr */
 			/* insert action */
 			CActionRobotMovement2DPtr dummy_odom = CActionRobotMovement2D::Create();	
@@ -303,13 +319,9 @@ void thread_update_pdf(TThreadRobotParam &p)
 			previousOdo.y(currentOdo.y());
 			previousOdo.phi(currentOdo.phi());
 				
-			/* insert observation */
-			obsPtr.setFromPointerDoNotFreeAtDtor(obs_2d);
-			senFrame->insert(obsPtr);
-				
 			/* add observation to our map for visualization */
-			CPose3D currentOdo3D(currentOdo);
-			obs_2d->insertObservationInto(&gridmap, &currentOdo3D);
+			//CPose3D currentOdo3D(currentOdo);
+			//obs_2d->insertObservationInto(&gridmap, &currentOdo3D);
 			
 			//	cout << "-------------------------      PDF     ----------------------" << endl;
 			PF.executeOn(
@@ -318,26 +330,33 @@ void thread_update_pdf(TThreadRobotParam &p)
 				senFrame.pointer(),	// Obs.
 				&PF_stats		// Output statistics
 				);
-	
-			CActionRobotMovement2DPtr best_mov_estim = actions->getBestMovementEstimation();
+			
+//			CActionRobotMovement2DPtr best_mov_estim = actions->getBestMovementEstimation();
 
-			if (best_mov_estim)
-			{
-				odometryEstimation = odometryEstimation + best_mov_estim->poseChange->getMeanVal();
-			//	cout << "odometryEstimation : " << odometryEstimation << endl;
-			}
-			pdf.getMean( pdfEstimation );
-			//cout << "pdfEstimation : " << pdfEstimation << endl;
+//			if (best_mov_estim)
+//			{
+//				odometryEstimation = odometryEstimation + best_mov_estim->poseChange->getMeanVal();
+//			//	cout << "odometryEstimation : " << odometryEstimation << endl;
+//			}
+//			pdf.getMean( pdfEstimation );
+//			//cout << "pdfEstimation : " << pdfEstimation << endl;
 			//cout << "mostlikelyParticle: " << pdf.getMostLikelyParticle() << endl;
-	
-			p.pdf.set( pdf.duplicateGetSmartPtr() );
-			p.displayNewPdf.set(true);
+			/* check if anyone is referencing the pdf */
+			
+			
+			/* atomic lock, deadlock anyone?  */
+			{
+				mrpt:synch::CCriticalSectionLocker l(&(p.pdf_lock));
+				p.pdf.set( pdf.duplicateGetSmartPtr() );
+				p.displayNewPdf.set(true);
+			}/* CCriticalSectionLocker destructor called, release lock */
+			
 			
 			//cout << "adaptive sample size : " << PF.adaptiveSampleSizepdf.size() << endl;
 			//cout << "-------------------------------------------------------------" << endl;	
 			
 		}/* end if */			
-			mrpt::system::sleep(POLL_INTERVAL); 
+			mrpt::system::sleep(POLL_INTERVAL/3); 
 	}/* end while */
 	
 	/* done and save outputs */	
@@ -395,7 +414,8 @@ void thread_kinect(TThreadRobotParam &p)
 				p.new_obs.set(obs);
 				p.new_obs_imu.set(obs_imu);
 			}
-
+			
+			mrpt::system::sleep(2);
 		}/* end while*/
 	}
 	catch(std::exception &e)
@@ -404,7 +424,6 @@ void thread_kinect(TThreadRobotParam &p)
 		p.quit.set(true);
 	}
 }
-
 /*
  * @Description
  * Try to drive our robot smoothly: avoid stop (between steps) if don't need to. Also
@@ -430,6 +449,7 @@ static void smoothDrive(CActivMediaRobotBase & aRobot, deque<poses::TPoint2D> aP
 	fixOdometry( previousOdo, thrPar.odometryOffset.get() );	
 	
 	/* for each individual step on path */
+	int count = 0;
 	for (deque<poses::TPoint2D>::const_iterator it=aPath.begin(); it!=aPath.end() && (thrPar.quit.get() == false); ++it) 
 	{
 		double phi;
@@ -451,6 +471,8 @@ static void smoothDrive(CActivMediaRobotBase & aRobot, deque<poses::TPoint2D> aP
 		//cout << " Fixed Odometry: " << currentOdo;
 		thrPar.currentOdo.set(currentOdo);
 		//cout << " Fixed Odometry 2: " << currentOdo << endl;
+		
+
 							
 		while(    /* lower bound, make sure robot does not pass target */
 		          ( currentOdo.distanceTo(CPoint2D(it->x,it->y)) > FORWARD_THRESHOLD ) 
@@ -461,8 +483,22 @@ static void smoothDrive(CActivMediaRobotBase & aRobot, deque<poses::TPoint2D> aP
 			   && (thrPar.stop.get() == false)
 			 ) 
 		{				
-			/* calculate required phi to next nearby target */		
-			phi = atan2 ( (it->y - currentOdo.y() ) , (it->x - currentOdo.x() ) );
+
+		
+//			if	( 
+//						( currentOdo.distanceTo(CPoint2D(it->x,it->y)) < 2*FORWARD_THRESHOLD ) 
+//		    		&&	( (it+1) != aPath.end() )
+//		    	)
+//		    {
+//		    	/* calculate required phi to next nearby target */		
+//				phi = atan2 ( ((it+1)->y - currentOdo.y() ) , ((it+1)->x - currentOdo.x() ) );
+
+//		    }  
+//		    else
+		    {
+		    	phi = atan2 ( ((it)->y - currentOdo.y() ) , ((it)->x - currentOdo.x() ) );
+		    }
+		
 			/* the next dozen lines of code basically determine whether robot
 			 * should stop and turn or not 
 			 */
@@ -482,100 +518,285 @@ static void smoothDrive(CActivMediaRobotBase & aRobot, deque<poses::TPoint2D> aP
 				turn(aRobot,phi, thrPar);
 				aRobot.getOdometry(currentOdo);
 				fixOdometry( currentOdo, thrPar.odometryOffset.get() );
-				cout << "Phi after turn: " << currentOdo.phi() << endl;
+				cout << "Phi after turn: " << RAD2DEG(currentOdo.phi()) << endl;
 			}	
 			
 			/* simple collision avoidance "smooth" drive */
-			
-			/* if no obstacle */
-			if(			(thrPar.leftObstacle.get() == false)	
-	    	   		&&	(thrPar.rightObstacle.get() == false)	
-	    	   		&& 	(thrPar.centerObstacle.get() == false)		)
-			{
-				/* driving to next target */	
-				/* FIXME : adjust ANGULAR_SPEED_DIV for better drive */
-				double turn_angle = turnAngle(currentOdo.phi(), phi) / ANGULAR_SPEED_DIV;
-				if (turn_angle < .01) 
-					turn_angle = 0;				
-				/* FIXME : segmentation fault happens sometime, probably it has something
-				 * to do with the fixOdometry()
-				 */
-				//cout << "after turnangle " << turn_angle << endl;
-				aRobot.setVelocities( LINEAR_SPEED, turn_angle); //turnAngle(aRobot, phi, thrPar) / 5 );
-			} 
-			else if (thrPar.rightObstacle.get() == true && thrPar.leftObstacle.get() == false)
-			{
-				/*turn to the left to avoid the wall on the right */
-				aRobot.setVelocities( LINEAR_SPEED / 2, 0.2 );
-				//sleep(200);			
-			}
-			else if (thrPar.leftObstacle.get() == true && thrPar.rightObstacle.get() == false)
-			{
-				/* turn to the right to avoid the wall on the left. */
-				aRobot.setVelocities( LINEAR_SPEED / 2, -0.2 );
-				//sleep(200);
-			}
-			else	/* obstacle in front. FIXME: not having any appropriate behaviour for this */
-			{
-				cout << "error! I am confused and cannot navigate appropriately at this time." << endl;
-				//thrPar.stop.set(true);
-				//aRobot.setVelocities(0, 0);
-			}
-
+			int left_obstacle, right_obstacle, center_obstacle, recover;
 			/* update sonar reading to display */
 			CObservationRange obs;
 			bool thereis;
 			aRobot.getSonarsReadings(thereis,obs);
 			if (!thereis)
 			{
-				cout << "Sonars: NO" << endl;
+				//cout << "Sonars: NO" << endl;
 			}
 			else
 			{
 				adjustCObservationRangeSonarPose( obs );
 				displaySonars(thrPar, obs);
-				//cout << "Sonars: ";
-				//for (CObservationRange::const_iterator i=obs.sensedData.begin();i!=obs.sensedData.end();++i)
-				//	cout << i->sensedDistance << " ";
-				//cout << endl;
-			}
-
+				int index = 0;
+				for (CObservationRange::const_iterator i=obs.sensedData.begin();i!=obs.sensedData.end();++i)
+				{
+					//cout << i->sensedDistance << " ";
+					if( i->sensedDistance > 0.02 && i->sensedDistance < 0.3 )
+						recover = 1;
+						
+					if (index == 2 || index == 1 || index == 0 || index == 15)
+					{
+						if(i->sensedDistance > 0.02 && i->sensedDistance < OBSTACLE_DISTANCE)
+							left_obstacle = 1;
+						else
+							left_obstacle = 0;
+					}
+					else if (index == 4 || index == 3)
+					{
+						if(i->sensedDistance > 0.02 && i->sensedDistance < OBSTACLE_DISTANCE)
+							center_obstacle = 1;
+						else
+							center_obstacle = 0;
+					}
+					else if (index == 6 || index == 5 || index == 7 )
+					{
+						if(i->sensedDistance > 0.02 && i->sensedDistance < OBSTACLE_DISTANCE)
+							right_obstacle = 1;
+						else
+							right_obstacle = 0;
+						
+					}
+					
+					//if(index == 7)
+					//	break;
+					
+					index++;
+					
+				}
+		 	}
+		 	
+				/* if no obstacle */
+	//			if(			(thrPar.leftObstacle.get() == false)	
+	//	    	   		&&	(thrPar.rightObstacle.get() == false)	
+	//	    	   		&& 	(thrPar.centerObstacle.get() == false)		)
+				if(			(left_obstacle == 0)	
+				   		&&	(right_obstacle == 0)	
+				   		&& 	(center_obstacle == 0)
+				   		//&&  (recover == 0)		
+				  )
+				{
+					//cout << "before turnangle " << endl;
+				
+					/* driving to next target */	
+					/* FIXME : adjust ANGULAR_SPEED_DIV for better drive */
+					double turn_angle = turnAngle(currentOdo.phi(), phi) / ANGULAR_SPEED_DIV;
+					aRobot.setVelocities( LINEAR_SPEED, turn_angle); //turnAngle(aRobot, phi, thrPar) / 5 );
+				} 
+	//			else if (thrPar.rightObstacle.get() == true && thrPar.leftObstacle.get() == false)
+				else if (right_obstacle == 1 && left_obstacle == 0)
+				{
+					/*turn to the left to avoid the wall on the right */
+					aRobot.setVelocities( LINEAR_SPEED, ANGULAR_SPEED );
+					//sleep(200);			
+				}
+	//			else if (thrPar.leftObstacle.get() == true && thrPar.rightObstacle.get() == false)
+				else if (left_obstacle == 1 && right_obstacle == 0 )
+				{
+					/* turn to the right to avoid the wall on the left. */
+					aRobot.setVelocities( LINEAR_SPEED, -ANGULAR_SPEED );
+					//sleep(200);
+				}
+				else if(center_obstacle == 1 )
+				/* obstacle in front. FIXME: not having any appropriate behaviour for this */
+				{
+					aRobot.setVelocities( 0, ANGULAR_SPEED );
+					cout << "error! I am confused and cannot navigate appropriately at this time." << endl;
+					//mrpt::system::sleep(5000);
+					//thrPar.stop.set(true);
+					recover = 1;
+				}
+			
+				if (recover == 1) 	
+				{
+					cout << "close to wall, recover... " << endl;
+					if (left_obstacle == 1)
+					{
+						aRobot.setVelocities(-LINEAR_SPEED/2,ANGULAR_SPEED);
+						mrpt::system::sleep(5000);
+					}
+					else if (right_obstacle == 1)
+					{
+						aRobot.setVelocities(-LINEAR_SPEED/2,-ANGULAR_SPEED);
+						mrpt::system::sleep(5000);
+					}
+					else if (center_obstacle == 1)
+					{
+						//aRobot.setVelocities(0,-ANGULAR_SPEED);
+						turn(aRobot,DEG2RAD(0), thrPar);	
+						turn(aRobot,DEG2RAD(90), thrPar);	
+						turn(aRobot,DEG2RAD(179), thrPar);	
+						turn(aRobot,DEG2RAD(-90), thrPar);	
+						turn(aRobot,DEG2RAD(0), thrPar);
+		
+						overwriteWithPdf(aRobot,thrPar);
+					
+						//mrpt::system::sleep(5000);
+					}
+					/* do a full scan to recover */
+					thrPar.pdfResetDeterministic.set(true);
+					//turn(aRobot,DEG2RAD(0), thrPar);	
+					//turn(aRobot,DEG2RAD(90), thrPar);	
+					//turn(aRobot,DEG2RAD(179), thrPar);	
+					//turn(aRobot,DEG2RAD(-90), thrPar);	
+					//turn(aRobot,DEG2RAD(0), thrPar);
+		
+					//overwriteWithPdf(aRobot,thrPar);
+					//count--;
+					recover = 0;
+				}
+			
+			
 			mrpt::system::sleep(POLL_INTERVAL);
 			
 			/* update robot status */
-			
+			//cout << "before fixOdometry" << endl;
 			aRobot.getOdometry( currentOdo ); /* for stop condition */
 			fixOdometry( currentOdo, thrPar.odometryOffset.get() );
 			thrPar.currentOdo.set(currentOdo);
+			//cout << "after fixOdometry" << endl;
+							
 			//cout << "end while" << endl;
-		}/* end while */
-		
-		/* FIXME: update robot odometry to mostlikely particle, below is an example, not tested.
-		 * The issue is in the changeOdometry() function, which does not work properly. Our current
-		 * fix for this is to do a mapping using odometryOffset
-		 */
-//		CMonteCarloLocalization2D * tempPdf = (CMonteCarloLocalization2D*)thrPar.pdf.get().pointer();
-//		CPose2D tempPose;
-//		tempPdf->getMean( tempPose );
-//		CPose2D startOdo;
-//		aRobot.getOdometry (startOdo);
-//		startOdo.x(0);
-//		startOdo.y(0);
-//		//CPose2D startOdo(newX,newY,DEG2RAD(newPhi));
-//		CPose2D newOffset = tempPose;
-//		newOffset.phi( DEG2RAD(tempPose.phi()) - startOdo.phi() );
-//		thrPar.odometryOffset.set(newOffset);					
-//		aRobot.changeOdometry(startOdo);
-//		currentOdo = tempPose;	
-//	
+		}/* end while */				
+	
+	
+				/* FIXME: update robot odometry to mostlikely particle, below is an example, not tested.
+				 * The issue is in the changeOdometry() function, which does not work properly. Our current
+				 * fix for this is to do a mapping using odometryOffset
+				 */
+
+				/* get current prediction */
+			if(count == stepsBeforeOverwrite)
+			{
+				count = 0;
+				overwriteWithPdf(aRobot,thrPar);
+//				CPose2D tempPose;
+//				/* critical section */				
+//				{
+//					mrpt::synch::CCriticalSectionLocker l(&(thrPar.pdf_lock));
+//					CMonteCarloLocalization2D* tempPdf = (CMonteCarloLocalization2D*)(thrPar.pdf.get().pointer());
+//					tempPdf->getMean( tempPose );
+//				}/* lock destructor called here */
+//				
+//				CPose2D tempPose2;
+//				aRobot.getOdometry (tempPose2);
+//				fixOdometry( tempPose2, thrPar.odometryOffset.get() );
+//		
+//				tempPose.x() = (tempPose.x() + tempPose2.x())/2; 
+//				tempPose.y() = (tempPose.y() + tempPose2.y())/2;
+//				
+//				/* case where 179 degree and -179 degree are not that far away */
+//				if( abs(tempPose.phi() - tempPose.phi()) < DEG2RAD(SHARP_TURN) ) 
+//					tempPose.phi() = (tempPose.phi() + tempPose2.phi())/2;
+//				
+//				/* magic here: our changeOdometry */
+//				CPose2D startOdo;
+//				aRobot.getOdometry( startOdo );
+//				startOdo.x(0);
+//				startOdo.y(0);
+//				CPose2D newOffset(tempPose.x(),tempPose.y(),tempPose.phi() - startOdo.phi() );
+//				thrPar.odometryOffset.set(newOffset);					
+//				aRobot.changeOdometry(startOdo);
+			}
+			count++;
 	} /* end for */
 
+	aRobot.setVelocities( LINEAR_SPEED, 0 );	
+	mrpt::system::sleep(1000);
+	/* do a full scan to recover */
+	turn(aRobot,DEG2RAD(0), thrPar);	
+	turn(aRobot,DEG2RAD(90), thrPar);	
+	turn(aRobot,DEG2RAD(179), thrPar);	
+	turn(aRobot,DEG2RAD(-90), thrPar);	
+	turn(aRobot,DEG2RAD(0), thrPar);
+		
+	overwriteWithPdf(aRobot,thrPar);
 	/* done driving and save outputs */	
 	aRobot.setVelocities( 0, 0 );	
 	thrPar.stop.set(false);
 //	
 }
-
+/*
+ * @Description
+ * fix current odometry using pdf.
+ * @param	
+ *			
+ * @return	
+ */
+void overwriteWithPdf(CActivMediaRobotBase & robot,TThreadRobotParam &p )
+{
+	CPose2D tempPose;
+	/* critical section */				
+	{
+		mrpt::synch::CCriticalSectionLocker l(&(p.pdf_lock));
+		CMonteCarloLocalization2D* tempPdf = (CMonteCarloLocalization2D*)(p.pdf.get().pointer());
+		tempPdf->getMean( tempPose );
+	}/* lock destructor called here */
+				
+	CPose2D tempPose2;
+	/* lock */
+	{
+		mrpt::synch::CCriticalSectionLocker l1(&(p.robot_lock));
+		robot.getOdometry (tempPose2);
+	}/*release lock */
+			
+	fixOdometry( tempPose2, p.odometryOffset.get() );
+		
+	tempPose.x() = (tempPose.x() + tempPose2.x())/2; 
+	tempPose.y() = (tempPose.y() + tempPose2.y())/2;
+				
+	/* case where 179 degree and -179 degree are not that far away */
+	if( abs(tempPose.phi() - tempPose.phi()) < DEG2RAD(SHARP_TURN) ) 
+	{
+		tempPose.phi() = (tempPose.phi() + tempPose2.phi())/2;
+	}			
+	/* magic here: our changeOdometry */
+	CPose2D startOdo;
+	
+	/* lock */
+	{
+		mrpt::synch::CCriticalSectionLocker l2(&(p.robot_lock));
+		robot.getOdometry( startOdo );
+	}/*release lock */
+	
+	startOdo.x(0);
+	startOdo.y(0);
+	CPose2D newOffset(tempPose.x(),tempPose.y(),tempPose.phi() - startOdo.phi() );
+	p.odometryOffset.set(newOffset);					
+	
+	/* lock */
+	{
+		mrpt::synch::CCriticalSectionLocker l3(&(p.robot_lock));
+		robot.changeOdometry(startOdo);	
+	}/*release lock */
+}
+bool isValidScan(CObservation2DRangeScan* scanData)
+{
+	int count = 0;		
+	int i;
+	if (scanData == NULL)
+		return false;
+	
+	for (i = 0; i < scanData->scan.size(); i++)
+	{
+		if (scanData->scan[i] < kinectMinTruncateDistance || scanData->validRange[i] == 0)
+			count++;
+	}
+	if (count > ( scanData->scan.size() )*4/5)
+	{
+		cout << "invalid scan!!!!!!!!!!!!!" << endl;	
+		return false;
+	}	
+	return true;
+		
+}
 /*
  * @Description
  * Get current kinect reading
@@ -680,14 +901,17 @@ double turnAngle(double current_phi, double phi)
 	if ( abs(odoTemp.phi() - phi) > SMALL_NUMBER ) /* small diff */ 
 	{
 		ret = -ret;
+		//cout << "left" << endl;
 	}
+	//else
+		//cout << "right" << endl;
 
 	return ret;			
 }
 
 /*
  * @Description
- * Turn robot direction to target next target
+ * Turn robot direction to next target
  * 
  * @param	phi:	is the desired turn angle, which referenced to the map coordiate,
  *					not the current "phi" of robot phi must be normalized into range 
@@ -758,13 +982,7 @@ static void turn(CActivMediaRobotBase &robot, double phi, TThreadRobotParam &p)
 }
 
 
-/*
- * @Description
- * Thread to display robot and map in a 3D window.
- * 
- * @param	p:	 	thread parameter list
- * @return	none
- */
+/* this thread updates the display */
 void thread_display(TThreadRobotParam &p)
 {
 	mrpt::opengl::CSetOfObjectsPtr		gl_grid,gl_pdf;
@@ -781,27 +999,28 @@ void thread_display(TThreadRobotParam &p)
 	COpenGLScenePtr &theScene = win.get3DSceneAndLock();
 	the_grid.loadFromBitmapFile(MAP_FILE,MAP_RESOLUTION /*,xCentralPixel,yCentralPixel*/);
 
-	{ 	/* display map */
+	{
 		if (!gl_grid) gl_grid = CSetOfObjects::Create();
 		gl_grid->clear();
 		the_grid.getAs3DObject( gl_grid );
-		theScene->insert( gl_grid );
 	}
+	theScene->insert( gl_grid );
 
-	{	/* display grid */
+	{
 		opengl::CGridPlaneXYPtr obj = opengl::CGridPlaneXY::Create(-55,55,-41,41,0,1);
 		obj->setColor(0.8,0.8,0.8);
 		theScene->insert( obj );
 	}
 
-	{	/* display current pose */
+	{
 		opengl::CSetOfObjectsPtr obj = opengl::stock_objects::RobotPioneer();
+		//obj->setColor(0,0,1);
+		//obj->setRadius(0.3);
 		obj->setPose(p.currentOdo.get());
 		obj->setName( "robot" );
 		theScene->insert( obj );
 	}
-
-	{	/* display target point */
+	{
 		opengl::CSpherePtr obj = opengl::CSphere::Create();
 		obj->setColor(0,1,0);
 		obj->setRadius(0.1);
@@ -809,15 +1028,13 @@ void thread_display(TThreadRobotParam &p)
 		obj->setName( "target");
 		theScene->insert( obj );
 	}
-
-	{	/* display sonar readings */
+	{
 		opengl::CSetOfLinesPtr obj = opengl::CSetOfLines::Create();
 		obj->setPose(p.currentOdo.get() );
 		obj->setName( "sonars" );
 		obj->setColor(1,0,0);
 	}
-
-	{	/* display pdf mean *FIXME* Arrow not positioned properly. The point is at the base of the arrow. */ 
+	{
 		opengl::CArrowPtr obj = opengl::CArrow::Create(0,0,2, 0,0,0, 0.05, 0.01,0.02, 0,0,0 );
 		obj->setPose(p.currentOdo.get());
 		obj->setName( "mostlikelyParticle" );
@@ -838,14 +1055,34 @@ void thread_display(TThreadRobotParam &p)
 	CTicTac  timer;
 	timer.Tic();
 
+//	CVideoFileWriter  vid;
+//	CImage	img;
+//	win.getLastWindowImage(img);
+//    vid.open("test.avi",15,img.getSize(),"MJPG",true);
+//	win.captureImagesStart();
+//	int imgCtr = 0;
+//	int imgCtrCnt = 10;
+
 	while (!end && win.isOpen() )
 	{
 		const double t = timer.Tac();
 
+
+		
 		// Move the scene:
 		COpenGLScenePtr &theScene = win.get3DSceneAndLock();
 
-		// Display the current gridmap x,y position of the cursor on the screen.
+//		if (imgCtr==imgCtrCnt) 
+//		{
+//			imgCtr=0; 
+//			win.getLastWindowImage(img);
+//			vid << img;
+//		} else 
+//		{
+//			imgCtr++;
+//		}
+
+		// Display the current x,y position of the cursor on the screen.
 		int mouse_x,mouse_y;
 		if (win.getLastMousePosition(mouse_x,mouse_y))  // See also: getLastMousePositionRay()
 		{
@@ -864,13 +1101,17 @@ void thread_display(TThreadRobotParam &p)
 			mrpt::math::TPoint3D inters_pt;
 			if (inters.getPoint(inters_pt))
 			{
-				// Display x,y coordinates and left, center, right collision detect flags.
-				string location = format("X,Y Location: %05f, %05f", (float)inters_pt.x,(float)inters_pt.y );
-				if( p.leftObstacle.get() ) location += string ( " LEFT" );
-				if( p.centerObstacle.get() ) location += string ( " CENTER" );
-				if( p.rightObstacle.get() ) location += string ( " RIGHT" );					
-				win.addTextMessage(0.01,0.85, location, TColorf(0,0,1),"sans",12, mrpt::opengl::NICE, 0);
+				// Move an object to the position picked by the user:
+				//printf("PT: %f %f %f\n",);
+//				string location = format("X,Y Location: %05f, %05f", (float)inters_pt.x,(float)inters_pt.y );
+//				if( p.leftObstacle.get() ) location += string ( " LEFT" );
+//				if( p.centerObstacle.get() ) location += string ( " CENTER" );
+//				if( p.rightObstacle.get() ) location += string ( " RIGHT" );					
+//				//theScene->getByName("USER_MOUSE_PICK")->setLocation(inters_pt.x,inters_pt.y,inters_pt.z);
+//				win.addTextMessage(0.01,0.85, location, TColorf(0,0,1),"sans",12, mrpt::opengl::NICE, 0);
 			}
+
+			
 		}		
 
 		win.addTextMessage(5,-15,  // |X|,|Y|>1 means absolute coordinates, negative means from the top instead of the bottom.
@@ -884,55 +1125,65 @@ void thread_display(TThreadRobotParam &p)
 		// Point camera at the current robot position.
 		win.setCameraPointingToPoint(p.currentOdo.get().x(),p.currentOdo.get().y(),0);
 
-		/* Change pose of robot in display */
+		//const double R1 = 8;
+		//const double W1= 5.0, Q1 = 3.3;
 		opengl::CRenderizablePtr obj1 = theScene->getByName("robot");
 		obj1->setPose( p.currentOdo.get() ); //.x() , p.currentOdo.get().y() , 0 );
 
-		/* Change location of target marker */
+		//const double R2 = 6;
+		//const double W2= 1.3, Q2 = 7.2;
 		opengl::CRenderizablePtr obj2 = theScene->getByName("target");
 		obj2->setLocation(p.targetOdo.get().x() , p.targetOdo.get().y() , 0 );
 
-		/* Put new path in the display */
-		if(p.displayNewPath.get() )  
+		if(p.displayNewPath.get() ) 
 		{
 			std::deque<poses::TPoint2D> thePath(p.thePath.get());
 			for (std::deque<poses::TPoint2D>::const_iterator it=thePath.begin();it!=thePath.end();++it) 
 			{
+				//img.drawCircle( gridmap.x2idx(it->x),gridmap.getSizeY()-1-gridmap.y2idx(it->y),R, TColor(0,0,255) );
 				string objName;
 				std::stringstream sstm;
 				sstm << "path" << it->x << it->y;
 				objName = sstm.str();
 				opengl::CSpherePtr obj = opengl::CSphere::Create();
 				obj->setColor(1,0,0);
-				obj->setRadius(0.04);
+				obj->setRadius(0.05);
 				obj->setLocation(it->x,it->y,0);
 				obj->setName( objName );
 				theScene->insert( obj );
 			}			
 			p.displayNewPath.set(false);
 		}
-
-		/* Put new pdf in the display */
+		//cout << "get pdf flag" << endl;
 		if(p.displayNewPdf.get() )
 		{
 			if (!gl_pdf) {
 				gl_pdf = CSetOfObjects::Create();
 				
 			}
+			
 			if( p.displayClearOldPdf.get() ) gl_pdf->clear();			
-			CMonteCarloLocalization2D * tempPdf = (CMonteCarloLocalization2D*)p.pdf.get().pointer();
- 			tempPdf->getAs3DObject( gl_pdf );
+			//cout << "get pdf" << endl;
+			
+			CPose2D tempPose;
+			
+			/* critical section */
+			{
+				mrpt::synch::CCriticalSectionLocker l(&(p.pdf_lock));
+				CMonteCarloLocalization2D * tempPdf = (CMonteCarloLocalization2D*)(p.pdf.get().pointer());
+ 				tempPdf->getAs3DObject( gl_pdf );
+ 				tempPdf->getMean( tempPose );
+ 				p.displayNewPdf.set(false);
+ 			}/* lock destructor called, unlock */	
+			
 			theScene->insert( gl_pdf );
 			
 			opengl::CRenderizablePtr obj4 = theScene->getByName("mostlikelyParticle");
-			CPose2D tempPose;
-			tempPdf->getMean( tempPose );	
 			obj4->setPose( tempPose );	//tempPdf->getMostLikelyParticle() ); 
-			
-			p.displayNewPdf.set(false);
+			//cout << "end get pdf" << endl;		
+
 		}
 
-		/* Put new sonars in the display */
 		if(p.displayNewSonars.get() )
 		{
 			if ( p.displayClearOldSonar.get() ) 
@@ -955,8 +1206,8 @@ void thread_display(TThreadRobotParam &p)
 			theScene->insert( sonar_object );
 		}
 
-		/* Put new kinect ranges in the display */
 		{ 
+			//cout << "get kinect" << endl;
 			/* make sure that we have new kinect reading */
 			CObservation2DRangeScan* obs_2d = getKinect2DScan(p, last_obs);			
 								
@@ -981,10 +1232,8 @@ void thread_display(TThreadRobotParam &p)
 		// Update window:
 		win.forceRepaint();
 		mrpt::system::sleep(100);
-
-		/* Code to save images of the screen for creating movies.  */
-		/* *FIXME* Caused the kinect to work poorly due to the time spent saving files.  
-		//	It may help to reduce the frequency of saving the images 
+		
+		//cout << "probably end while" <<endl;
 		// Grab frame:
 		//mrpt::utils::CImagePtr img = win.getLastWindowImagePtr();
 		//if (img)
@@ -994,9 +1243,8 @@ void thread_display(TThreadRobotParam &p)
 		//	img->saveToFile(s);
 		//	//printf("Saved frame image to: %s \r",s.c_str() );  // "\ r" is to overwrite the same line over and over again..
 		//}
-		*/
 
-		/* Get key press events while 3D window is active. */
+		//if (mrpt::system::os::kbhit()) end = true;
 		if (win.keyHit())
 		{
 
@@ -1030,8 +1278,6 @@ void thread_display(TThreadRobotParam &p)
 					win.setCameraElevationDeg( win.getCameraElevationDeg() - 5 );
 					break;
 
-				/* Note: changing camera pointing to point is temporary because the  
-				   pointing to point is changed to current robot odometry each loop. */
 				case 'w':
 				case 'W':
 					{
@@ -1068,7 +1314,6 @@ void thread_display(TThreadRobotParam &p)
 					break;
 					}
 				
-				/* clear  / do not clear previous pdf before adding new pdf to display */
 				case 'p':
 					p.displayClearOldPdf.set(true);
 					break; 
@@ -1077,7 +1322,6 @@ void thread_display(TThreadRobotParam &p)
 					p.displayClearOldPdf.set(false);
 					break;
 
-				/* clear  / do not clear previous sonar readings before adding new pdf to display */
 				case 's':
 					p.displayClearOldSonar.set(true);
 					break;
@@ -1085,8 +1329,7 @@ void thread_display(TThreadRobotParam &p)
 				case 'S':
 					p.displayClearOldSonar.set(false);
 					break;
-	
-				/* stops current path finding navigation */
+
 				case ' ':
 					p.stop.set(true);
 					break;
@@ -1181,13 +1424,10 @@ static int PathPlanning(std::deque<poses::TPoint2D> &thePath, CPoint2D  origin, 
 }
 
 
-/*
- * @Description
- * Set up the locations and headings of the sonars for simulating sonar in the map.
- * 
- * @param	obs:	the sonar readings to be set.
- * @return	none
- */
+/*-------------------------------------------------------------
+						create CObservationRange object
+from					getSonarsReadings
+-------------------------------------------------------------*/
 void createCObservationRange( CObservationRange	&obs )
 {
 	obs.minSensorDistance = 0;
@@ -1223,14 +1463,6 @@ void createCObservationRange( CObservationRange	&obs )
 
 }
 
-/*
- * @Description
- * Create a deque of line segments from a sonar reading.  To be used by the display thread.
- * 
- * @param	p:		the thread parameter struct.
-			sonars: the sonar reading to be converted.
- * @return	none
- */
 void displaySonars(TThreadRobotParam &p, CObservationRange &sonars)
 {
 	deque<TSegment3D> sonarLines;	
@@ -1263,17 +1495,11 @@ void displaySonars(TThreadRobotParam &p, CObservationRange &sonars)
 			
 }
 
-/*
- * @Description
- * This function will adjust the poses for the sonars of the  
- * PeopleBot to the correct locations and angles.
- * The poses returned by the People bot are wrong.
- * I believe the error is that the Peoplebot thinks the back 
- * sonars are the upper ring, so they are facing forwards.
- * 
- * @param	obs:	the sonar readings to be fixed.
- * @return	none
- */
+// This function will adjust the poses for the sonars of the  
+// PeopleBot to the correct locations and angles.
+// The poses returned by the People bot are wrong.
+// I believe the error is that the Peoplebot thinks the back 
+// sonars are the upper ring, so they are facing forwards.
 void adjustCObservationRangeSonarPose( CObservationRange &obs )
 {
 	int sensor = 0;
@@ -1313,17 +1539,9 @@ void adjustCObservationRangeSonarPose( CObservationRange &obs )
 
 }
 
-/*
- * @Description
- * This function computes the likelihood of the observation given the pose and map.
- * The mrpt library likelihood function only works with laser scans, sonar scans 
- * are not supported. 
- * 
- * @param	map: 	the map for checking the sonar readings.
- *			pose: 	pose that current sonar readings will be checked at.			
- *			obs:	the sonar readings to be checked.
- * @return	none
- */
+// This function computes the likelihood of the observation given the pose and map.
+// The mrpt library likelihood function only works with laser scans, sonar scans 
+// are not supported. 
 double CObservationRangeLikelihood(COccupancyGridMap2D & map, CPose2D & pose, CObservationRange & obs)
 {
 	CObservationRange simObs;	
@@ -1374,18 +1592,8 @@ double CObservationRangeLikelihood(COccupancyGridMap2D & map, CPose2D & pose, CO
 	else return 0.0;
 }
 
-/*
- * @Description
- * *FIXME* Nonfunctional - the particle weights are not correctly set by this function.
- * This function uses the CObservationRangeLikelihood function to calculate likelihood
- * of each pose in the pdf with the current sonar readings.  Setting weights does not 
- * currently work.
- * 
- * @param	map: 	the map for checking the sonar readings.
- *			pdf: 	the list of possible robot poses to be compared to the current sonar readings.			
- *			obs:	the sonar readings to be checked.
- * @return	none
- */
+// This function will compute the likelihood values using the CObservationRangeLikelihood() function
+// for the pdf supplied.
 void computePdfLikelihoodValues(COccupancyGridMap2D & map, CMonteCarloLocalization2D & pdf, CObservationRange & obs)
 {
 	int numberOfParticles = pdf.particlesCount();
@@ -1400,18 +1608,6 @@ void computePdfLikelihoodValues(COccupancyGridMap2D & map, CMonteCarloLocalizati
 	pdf.normalizeWeights();
 }
 
-/*
- * @Description
- * Sets flags when the kinect detects range values below 1 meter.  Used for collision
- * avoidance.
- * sets the following threadsafe variables: 
- * - bool leftObstacle
- * - bool centerObstacle
- * - bool rightObstacle
- * 
- * @param	p: 		the thread parameters struct.
- * @return	none
- */
 void thread_wall_detect(TThreadRobotParam &p)
 {
 	CObservation3DRangeScanPtr  last_obs;		
@@ -1491,20 +1687,14 @@ void thread_wall_detect(TThreadRobotParam &p)
 			//else cout << endl;		
 		}
 
-		sleep(300);
+		mrpt::system::sleep(300);
 	} 
-
+	//cout << obs_2d.scan[0];
 }
 
-/*
- * @Description
- * Adjusts the given pose by rotating by phi given in offset and then adds the offset
- * x and y values.
- * 
- * @param	pose: 		the pose to be adjusted.
- * 			offset:		the pose containing the x,y, phi offset.
- * @return	none
- */
+// This function adjusts the odometry by rotating the pose by the angle given in offset, and adding the 
+// x and y values from the offset to the rotated values. 
+// This is required because setting the odometry to a value other than 0 degrees causes errors. 
 void fixOdometry(CPose2D & pose, CPose2D offset)
 {
 
@@ -1530,26 +1720,6 @@ void fixOdometry(CPose2D & pose, CPose2D offset)
 /**************************************************************************************************/
 /*                                            MAIN THREAD                                         */		
 /**************************************************************************************************/
-/*
- * @Description
- * After starting the threads for kinect, pdf, display and collision avoidance, 
- * loop while accepting manual commands.
- * command menu: 
- * 	- 	a/d   : +/- angular speed
- * 	- 	space : stop current motion
- * 	- 	o     : Query odometry (display odometry is only updated here)
- * 	- 	n     : Query sonars
- * 	- 	b     : Query battery level
- * 	- 	p     : Query bumpers
- * 	- 	P	  : Follow Path (manual control is not available during navigation)
- * 	- 	e	  : Enter new current pose
- * 	- 	t 	  : Enter new target for path Planning
- * 	- 	x     : Quit
- * 
- * @param	pose: 		the pose to be adjusted.
- * 			offset:		the pose containing the x,y, phi offset.
- * @return	none
- */
 int main(int argc, char **argv)
 {
 	try
@@ -1577,6 +1747,8 @@ int main(int argc, char **argv)
 		MAP_RESOLUTION		= 	guidebotConfFile.read_float("NavigationParams","MAP_RESOLUTION",0.048768f, true);
 		X_CENTRAL_PIXEL		=	guidebotConfFile.read_int("NavigationParams","X_CENTRAL_PIXEL",-30, true);
 		Y_CENTRAL_PIXEL		=	guidebotConfFile.read_int("NavigationParams","Y_CENTRAL_PIXEL",6, true);
+		stepsBeforeOverwrite =  guidebotConfFile.read_int("NavigationParams","stepsBeforeOverwrite",2, true);
+		OBSTACLE_DISTANCE	=	guidebotConfFile.read_double("NavigationParams","OBSTACLE_DISTANCE",0.8, true);
 		
 		kinectMinTruncateDistance = guidebotConfFile.read_float("NavigationParams","kinectMinTruncateDistance", .5f , true);
 		
@@ -1625,12 +1797,12 @@ int main(int argc, char **argv)
 		mrpt::system::TThreadHandle pdfHandle;
 		mrpt::system::TThreadHandle displayHandle;
 		mrpt::system::TThreadHandle thHandle; 
-		mrpt::system::TThreadHandle wallDetectHandle;
+		//mrpt::system::TThreadHandle wallDetectHandle;
 	
 		pdfHandle = mrpt::system::createThreadRef(thread_update_pdf ,thrPar);
 		displayHandle = mrpt::system::createThreadRef(thread_display ,thrPar);
 		thHandle = mrpt::system::createThreadRef(thread_kinect ,thrPar);
-		wallDetectHandle = mrpt::system::createThreadRef(thread_wall_detect, thrPar);
+		//wallDetectHandle = mrpt::system::createThreadRef(thread_wall_detect, thrPar);
 
 		/* Wait until data stream starts so we can say for sure the sensor has been initialized OK: */	
 		cout << "Waiting for sensor initialization...\n";
@@ -1661,10 +1833,12 @@ int main(int argc, char **argv)
 				cout << " n     : Query sonars" << endl;
 				cout << " b     : Query battery level" << endl;
 				cout << " p     : Query bumpers" << endl;
+				cout << " l/r	: Follow left/right wall" << endl;
+				cout << " u		: U-turn" << endl;
+				cout << " x     : Quit" << endl;
 				cout << " P		: Follow Path" << endl;
 				cout << " e		: Enter new current pose: " << endl;
 				cout << " t 	: Enter new target for path Planning: " << endl;
-				cout << " x     : Quit" << endl;
 			}
 
 			if (!mrpt::system::os::kbhit())
@@ -1679,30 +1853,30 @@ int main(int argc, char **argv)
 
 			show_menu=true;
 
-			if (c=='x') break;	/* quit */
+			if (c=='x') break;
 
-			if (c=='w' || c=='s') /* increase or decrease current linear velocity */
+			if (c=='w' || c=='s')
 			{
 				if (c=='w') cur_v += 0.05;
 				if (c=='s') cur_v -= 0.05;
 				robot.setVelocities( cur_v, cur_w );
 			}
 
-			if (c=='a' || c=='d')  /* increase or decrease current angular velocity */
+			if (c=='a' || c=='d')
 			{
 				if (c=='a') cur_w += 0.05;
 				if (c=='d') cur_w -= 0.05;
 				robot.setVelocities( cur_v, cur_w );
 			}
 
-			if (c==' ')  /* stop, set current linear and anhular velocities to 0 */
+			if (c==' ')
 			{
 				cur_v = 0;
 				cur_w = 0;
 				robot.setVelocities( cur_v, cur_w );
 			}
 
-			if (c=='o')  /* get current odometry reading */
+			if (c=='o')
 			{
 				CPose2D 	odo;
 				double 		v,w;
@@ -1713,14 +1887,14 @@ int main(int argc, char **argv)
 				cout << "Odometry: " << odo << " v: " << v << " w: " << RAD2DEG(w) << " left: " << left_ticks << " right: " << right_ticks << endl;
 			}
 
-			if (c=='p')  /* get current bumper readings */
+			if (c=='p')
 			{
 				vector_bool bumps;
 				robot.getBumpers(bumps);
 				cout << "Bumpers: "<< bumps << endl;
 			}
 
-			if (c=='n' || c=='N') /* get current sonar readings */
+			if (c=='n' || c=='N')
 			{
 				CObservationRange obs;
 				bool thereis;
@@ -1741,13 +1915,45 @@ int main(int argc, char **argv)
 				}
 			}
 
-			if (c=='b') /* get current battery charge */
+			if (c=='b')
 			{
 				double bat;
 				robot.getBatteryCharge(bat);
 				cout << "Battery: " << bat << endl;
 			}
+			
+			if (c=='u')
+			{
+				CPose2D 	odo;
+				CPose2D		target;
+				double 		v,w;
+				int64_t  	left_ticks, right_ticks;
+				robot.getOdometryFull( odo, v, w, left_ticks, right_ticks );
+				fixOdometry( odo, thrPar.odometryOffset.get() );
+				
 
+				cout << "Odometry: " << odo << " v: " << v << " w: " << RAD2DEG(w) << " left: " << left_ticks << " right: " << right_ticks << endl;
+				target = odo;
+				target.phi_incr(M_PI);
+				target.normalizePhi();				
+
+				cout << "Initial Pose: " << odo << " Target Pose: " << target << endl;
+				bool turn = true;
+				cur_w = M_PI/10;
+				robot.setVelocities(0,cur_w);				
+				while (turn) {
+					CPose2D 	cur_pose;
+					double 		v,w;
+					int64_t  	left_ticks, right_ticks;
+					robot.getOdometryFull( odo, v, w, left_ticks, right_ticks );
+					fixOdometry( odo, thrPar.odometryOffset.get() );		
+					cout << "Odometry: " << odo << " v: " << v << " w: " << RAD2DEG(w) << " left: " << left_ticks << " right: " << right_ticks << endl;
+					
+					if (cur_pose.phi() > (target.phi() - .01) && cur_pose.phi() > (target.phi() + .01)) turn = false;
+				}
+				robot.setVelocities(0,0);
+			}
+	
 			if (c=='e') /* enter current pose */
 			{
 				double newX, newY, newPhi;
@@ -1808,31 +2014,100 @@ int main(int argc, char **argv)
 				cout << " New target has been set! " << target << endl;				
 			}
 
-			if (c=='P') /* calculate a path and travel there using the smoothDrive function */
+			if (c=='P') /* Navigation and Localization */
 			{				
 				std::deque<poses::TPoint2D>		thePath;
 				CPose2D 	odo;
 				double 		v,w;
 				int64_t  	left_ticks, right_ticks;
 				double 		phi;
-				robot.getOdometry( odo );
+				robot.getOdometryFull( odo, v, w, left_ticks, right_ticks );
 				fixOdometry( odo, thrPar.odometryOffset.get() );
-			
+				
+				//CPose2D startOdo(-25.0,9.0,0);						
+				//robot.changeOdometry(startOdo);
+				//robot.getOdometryFull( odo, v, w, left_ticks, right_ticks );
+				
 				CPoint2D origin( odo.x(), odo.y() );
 				
 				if (PathPlanning( thePath, origin, target ) == 1) 
 				{
-					thrPar.pdfResetDeterministic.set(true);					
+					//thrPar.pdfResetDeterministic.set(true);					
 					thrPar.thePath.set(thePath);
 					thrPar.displayNewPath.set(true);
 					cout << "found a Path..." << endl;
 					smoothDrive(robot, thePath, thrPar );  
+					//alternateDrive( robot, thePath,thrPar );  // alternative to the smoothDrive for testing. not implemented.
 					cout << "at target..." << endl;					
 				} /* end path following */
 				
 			}
-	
+			
+			if (c=='r' || c=='l')
+			{
+				int sonar1 = (c=='r') ? 7 : 15;
+				int sonar2 = (c=='r') ? 8 : 0;
+				cout << "Following the right wall until forward sonars read one meter." << endl; 
+				bool parallel = false;
+				bool follow = true;
+				float wall_dist, wall_dist_set;
+				
+				cur_v = 0;
+				cur_w = 0;
+				robot.setVelocities( cur_v, cur_w );
 
+				CObservationRange obs;
+				bool thereis;
+				
+				mrpt::system::sleep(20);
+				
+		// make robot parallel to wall
+				while(!parallel)
+				{
+					robot.getSonarsReadings(thereis,obs);
+					if (thereis) {
+						float ratio = (obs.sensedData[sonar1].sensedDistance / obs.sensedData[sonar2].sensedDistance);
+	 					if ((ratio > 1.05) || (ratio < 0.95))
+						{
+							cur_v = 0.2;
+							cur_w = (1 - ratio)/2;
+							robot.setVelocities( cur_v, cur_w );	
+			 					cout << "Sonars: ";
+								cout << obs.sensedData[sonar1].sensedDistance << " ";
+								cout << obs.sensedData[sonar2].sensedDistance << " ";
+								cout << cur_w;
+							
+						} else { parallel = true;}
+					} else cout << "false";
+					mrpt::system::sleep(100);
+				}
+		
+		// Get current wall distance to use as target.		
+				wall_dist_set = (obs.sensedData[7].sensedDistance + obs.sensedData[8].sensedDistance)/2;
+				cout << "Wall distance: " << wall_dist_set;
+
+		// Follow wall, attempting to maintain current distance and parallel.
+				while(follow)
+				{
+					robot.getSonarsReadings(thereis,obs);
+
+					if (thereis) {
+						if ((obs.sensedData[3].sensedDistance < 3) || (obs.sensedData[4].sensedDistance < 3)) {
+							cur_v = (min(obs.sensedData[3].sensedDistance,obs.sensedData[4].sensedDistance) - 1) / 2;
+							if (cur_v <= 0) follow = false;							
+						}
+						float ratio = (obs.sensedData[sonar1].sensedDistance / obs.sensedData[sonar2].sensedDistance);						
+						if (ratio > 1.1 || ratio < 0.9) {
+							cur_w = 0;
+						} else if ((ratio > 1.02) || (ratio < 0.98))
+						{
+							cur_w = (1 - ratio)/2;
+						}	
+						robot.setVelocities( cur_v, cur_w );
+					}
+					mrpt::system::sleep(100);
+				}
+			}	// end follow right wall.		
 		}
 
 	/*join threads */
@@ -1840,7 +2115,7 @@ int main(int argc, char **argv)
 		thrPar.quit = true;
 		mrpt::system::joinThread(pdfHandle);
 		mrpt::system::joinThread(thHandle);
-		mrpt::system::joinThread(wallDetectHandle);
+		//mrpt::system::joinThread(wallDetectHandle);
 		mrpt::system::joinThread(displayHandle);
 		cout << "threads ended!\n";
 	}
