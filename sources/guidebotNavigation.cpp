@@ -523,82 +523,80 @@ static void smoothDrive(CActivMediaRobotBase & aRobot, deque<poses::TPoint2D> aP
                     index++;                    
                 }
              }
-			if(            (left_obstacle == 0)    
-					   &&    (right_obstacle == 0)    
-					   &&     (center_obstacle == 0)
-					   //&&  (recover == 0)        
-			  )
-			{
-				//cout << "before turnangle " << endl;
-			
-				/* driving to next target */    
-				/* FIXME : adjust ANGULAR_SPEED_DIV for better drive */
-				double turn_angle = turnAngle(currentOdo.phi(), phi) / ANGULAR_SPEED_DIV;
-				aRobot.setVelocities( LINEAR_SPEED, turn_angle); //turnAngle(aRobot, phi, thrPar) / 5 );
-			} 
-//            else if (thrPar.rightObstacle.get() == true && thrPar.leftObstacle.get() == false)
-			else if (right_obstacle == 1 && left_obstacle == 0)
-			{
-				/*turn to the left to avoid the wall on the right */
-				aRobot.setVelocities( LINEAR_SPEED, ANGULAR_SPEED );
-				//sleep(200);            
-			}
-//            else if (thrPar.leftObstacle.get() == true && thrPar.rightObstacle.get() == false)
-			else if (left_obstacle == 1 && right_obstacle == 0 )
-			{
-				/* turn to the right to avoid the wall on the left. */
-				aRobot.setVelocities( LINEAR_SPEED, -ANGULAR_SPEED );
-				//sleep(200);
-			}
-			else if(center_obstacle == 1 )
-			/* obstacle in front. FIXME: not having any appropriate behaviour for this */
-			{
-				aRobot.setVelocities( 0, ANGULAR_SPEED );
-				cout << "error! I am confused and cannot navigate appropriately at this time." << endl;
-				//mrpt::system::sleep(5000);
-				//thrPar.stop.set(true);
-				recover = 1;
-			}
-		
-			if (recover == 1)     
-			{
-				cout << "close to wall, recover... " << endl;
-				if (left_obstacle == 1)
-				{
-					aRobot.setVelocities(-LINEAR_SPEED/2,ANGULAR_SPEED);
-					mrpt::system::sleep(5000);
-				}
-				else if (right_obstacle == 1)
-				{
-					aRobot.setVelocities(-LINEAR_SPEED/2,-ANGULAR_SPEED);
-					mrpt::system::sleep(5000);
-				}
-				else if (center_obstacle == 1)
-				{
-					//aRobot.setVelocities(0,-ANGULAR_SPEED);
-					turn(aRobot,DEG2RAD(0), thrPar);    
-					turn(aRobot,DEG2RAD(90), thrPar);    
-					turn(aRobot,DEG2RAD(179), thrPar);    
-					turn(aRobot,DEG2RAD(-90), thrPar);    
-					turn(aRobot,DEG2RAD(0), thrPar);
-	
-					overwriteWithPdf(aRobot,thrPar);
-				
-					//mrpt::system::sleep(5000);
-				}
-				/* do a full scan to recover */
-				thrPar.pdfResetDeterministic.set(true);
-				//turn(aRobot,DEG2RAD(0), thrPar);    
-				//turn(aRobot,DEG2RAD(90), thrPar);    
-				//turn(aRobot,DEG2RAD(179), thrPar);    
-				//turn(aRobot,DEG2RAD(-90), thrPar);    
-				//turn(aRobot,DEG2RAD(0), thrPar);	
-				//overwriteWithPdf(aRobot,thrPar);
-				//count--;
-				recover = 0;
-			}
-		
+            if(   (left_obstacle == 0)    
+                &&(right_obstacle == 0)    
+                &&(center_obstacle == 0)
+              //&&  (recover == 0)        
+              )
+            {
+                //cout << "before turnangle " << endl;
             
+                /* driving to next target */    
+                /* FIXME : adjust ANGULAR_SPEED_DIV for better drive */
+                double turn_angle = turnAngle(currentOdo.phi(), phi) / ANGULAR_SPEED_DIV;
+                aRobot.setVelocities( LINEAR_SPEED, turn_angle); //turnAngle(aRobot, phi, thrPar) / 5 );
+            } 
+//            else if (thrPar.rightObstacle.get() == true && thrPar.leftObstacle.get() == false)
+            else if (right_obstacle == 1 && left_obstacle == 0)
+            {
+                /*turn to the left to avoid the wall on the right */
+                aRobot.setVelocities( LINEAR_SPEED, ANGULAR_SPEED );
+                //sleep(200);            
+            }
+//            else if (thrPar.leftObstacle.get() == true && thrPar.rightObstacle.get() == false)
+            else if (left_obstacle == 1 && right_obstacle == 0 )
+            {
+                /* turn to the right to avoid the wall on the left. */
+                aRobot.setVelocities( LINEAR_SPEED, -ANGULAR_SPEED );
+                //sleep(200);
+            }
+            else if(center_obstacle == 1 )
+            /* obstacle in front. FIXME: not having any appropriate behaviour for this */
+            {
+                aRobot.setVelocities( 0, ANGULAR_SPEED );
+                cout << "error! I am confused and cannot navigate appropriately at this time." << endl;
+                //mrpt::system::sleep(5000);
+                //thrPar.stop.set(true);
+                recover = 1;
+            }
+        
+            if (recover == 1)     
+            {
+                cout << "close to wall, recover... " << endl;
+                if (left_obstacle == 1)
+                {
+                    aRobot.setVelocities(-LINEAR_SPEED/2,ANGULAR_SPEED);
+                    mrpt::system::sleep(5000);
+                }
+                else if (right_obstacle == 1)
+                {
+                    aRobot.setVelocities(-LINEAR_SPEED/2,-ANGULAR_SPEED);
+                    mrpt::system::sleep(5000);
+                }
+                else if (center_obstacle == 1)
+                {
+                    //aRobot.setVelocities(0,-ANGULAR_SPEED);
+                    turn(aRobot,DEG2RAD(0), thrPar);    
+                    turn(aRobot,DEG2RAD(90), thrPar);    
+                    turn(aRobot,DEG2RAD(179), thrPar);    
+                    turn(aRobot,DEG2RAD(-90), thrPar);    
+                    turn(aRobot,DEG2RAD(0), thrPar);
+    
+                    overwriteWithPdf(aRobot,thrPar);
+                
+                    //mrpt::system::sleep(5000);
+                }
+                /* do a full scan to recover */
+                thrPar.pdfResetDeterministic.set(true);
+                //turn(aRobot,DEG2RAD(0), thrPar);    
+                //turn(aRobot,DEG2RAD(90), thrPar);    
+                //turn(aRobot,DEG2RAD(179), thrPar);    
+                //turn(aRobot,DEG2RAD(-90), thrPar);    
+                //turn(aRobot,DEG2RAD(0), thrPar);    
+                //overwriteWithPdf(aRobot,thrPar);
+                //count--;
+                recover = 0;
+            }
             mrpt::system::sleep(POLL_INTERVAL);
             
             /* update robot status */
@@ -610,13 +608,12 @@ static void smoothDrive(CActivMediaRobotBase & aRobot, deque<poses::TPoint2D> aP
             //cout << "end while" << endl;
         }/* end while */                
     
+            /* FIXME: update robot odometry to mostlikely particle, below is an example, not tested.
+             * The issue is in the changeOdometry() function, which does not work properly. Our current
+             * fix for this is to do a mapping using odometryOffset
+             */
 
-			/* FIXME: update robot odometry to mostlikely particle, below is an example, not tested.
-			 * The issue is in the changeOdometry() function, which does not work properly. Our current
-			 * fix for this is to do a mapping using odometryOffset
-			 */
-
-			/* get current prediction */
+            /* get current prediction */
             if(count == stepsBeforeOverwrite)
             {
                 count = 0;
@@ -971,32 +968,12 @@ void thread_display(TThreadRobotParam &p)
     CTicTac  timer;
     timer.Tic();
 
-//    CVideoFileWriter  vid;
-//    CImage    img;
-//    win.getLastWindowImage(img);
-//    vid.open("test.avi",15,img.getSize(),"MJPG",true);
-//    win.captureImagesStart();
-//    int imgCtr = 0;
-//    int imgCtrCnt = 10;
-
     while (!end && win.isOpen() )
     {
         const double t = timer.Tac();
-
-
         
         // Move the scene:
         COpenGLScenePtr &theScene = win.get3DSceneAndLock();
-
-//        if (imgCtr==imgCtrCnt) 
-//        {
-//            imgCtr=0; 
-//            win.getLastWindowImage(img);
-//            vid << img;
-//        } else 
-//        {
-//            imgCtr++;
-//        }
 
         // Display the current x,y position of the cursor on the screen.
         int mouse_x,mouse_y;
@@ -1149,18 +1126,6 @@ void thread_display(TThreadRobotParam &p)
         win.forceRepaint();
         mrpt::system::sleep(100);
         
-        //cout << "probably end while" <<endl;
-        // Grab frame:
-        //mrpt::utils::CImagePtr img = win.getLastWindowImagePtr();
-        //if (img)
-        //{
-        //    static int i=0;
-        //    const string s = format("GRAB_%06i.png", ++i );
-        //    img->saveToFile(s);
-        //    //printf("Saved frame image to: %s \r",s.c_str() );  // "\ r" is to overwrite the same line over and over again..
-        //}
-
-        //if (mrpt::system::os::kbhit()) end = true;
         if (win.keyHit())
         {
 
@@ -1256,8 +1221,6 @@ void thread_display(TThreadRobotParam &p)
     };
 
 }
-
-
 
 // ------------------------------------------------------
 //                TestPathPlanning
